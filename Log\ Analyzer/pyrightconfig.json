@@ -1,0 +1,9 @@
+{
+  "include": ["common", "services", "scripts"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    }
+  ]
+}

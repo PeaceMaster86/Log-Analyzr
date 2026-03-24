@@ -1,0 +1,135 @@
+version: "3.9"
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw_logs --partitions 3 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic parsed_logs --partitions 3 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic detections --partitions 3 --replication-factor 1 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic enriched_alerts --partitions 3 --replication-factor 1
+      "
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+
+  parser-service:
+    build:
+      context: .
+      dockerfile: services/parser_service/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RAW_TOPIC: raw_logs
+      PARSED_TOPIC: parsed_logs
+      RAW_ARCHIVE_DIR: /tmp/raw_archive
+    volumes:
+      - ./data/raw_archive:/tmp/raw_archive
+
+  rule-detector-service:
+    build:
+      context: .
+      dockerfile: services/rule_detector_service/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PARSED_TOPIC: parsed_logs
+      DETECTIONS_TOPIC: detections
+      BRUTE_FORCE_THRESHOLD: 5
+      BRUTE_FORCE_WINDOW_SECONDS: 120
+      REQUEST_RATE_THRESHOLD: 80
+      ERROR_RATE_THRESHOLD: 0.35
+
+  anomaly-service:
+    build:
+      context: .
+      dockerfile: services/anomaly_service/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PARSED_TOPIC: parsed_logs
+      DETECTIONS_TOPIC: detections
+
+  enrichment-service:
+    build:
+      context: .
+      dockerfile: services/enrichment_service/Dockerfile
+    depends_on:
+      - opensearch
+      - kafka-init
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DETECTIONS_TOPIC: detections
+      ENRICHED_ALERTS_TOPIC: enriched_alerts
+      OPENSEARCH_HOST: opensearch
+      OPENSEARCH_PORT: 9200
+      OPENSEARCH_INDEX: siem-alerts
+
+  alerting-service:
+    build:
+      context: .
+      dockerfile: services/alerting_service/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ENRICHED_ALERTS_TOPIC: enriched_alerts
+      ALERT_SEVERITY_THRESHOLD: medium
+      WEBHOOK_URL: ""
+
+  log-generator:
+    build:
+      context: .
+      dockerfile: services/log_generator/Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RAW_TOPIC: raw_logs
+    volumes:
+      - ./samples:/app/samples
